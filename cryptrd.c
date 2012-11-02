@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
+#include <linux/sysfs.h>
 
 #include <linux/kernel.h> /* printk() */
 #include <linux/fs.h>     /* everything... */
@@ -31,6 +32,47 @@ module_param(logical_block_size, int, 0);
 
 static int nsectors = 1024;
 module_param(nsectors, int, 0);
+
+#define KEY_SIZE 128
+static char crypto_key[KEY_SIZE];
+
+ssize_t key_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	printk("cryptrd: copying key %s\n", crypto_key);
+	return scnprintf(buf, PAGE_SIZE, "%s\n", crypto_key);
+}
+
+ssize_t key_store(struct device *dev, struct device_attribute *attr, char *buf,
+                  size_t count)
+{
+	/*if (count != KEY_SIZE) {
+		printk(KERN_NOTICE "cryptrd: invalid key size %u", count);
+		return -EINVAL;
+	}
+
+	printk("cryptrd: using key %s\n", buf);
+	memcpy(crypto_key, buf, KEY_SIZE);
+	printk("cryptrd: copied key\n");
+	return KEY_SIZE;
+	*/
+	printk("cryptrd: storing key %s\n", buf);
+	snprintf(crypto_key, sizeof(crypto_key), "%.*s",
+		 (int)min(count, sizeof(crypto_key) - 1), buf);
+	return count;
+}
+
+DEVICE_ATTR(key, 0600, key_show, key_store);
+
+/*static struct device_attribute cryptrd_attrs[] = {
+	__ATTR(key, 0600, key_show, key_store),
+	__ATTR_NULL
+};*/
+
+/*static struct class cryptrd_class = {
+	.name = "cryptrd",
+	.owner = THIS_MODULE,
+	.class_attrs = cryptrd_attrs
+};*/
 
 #define KERNEL_SECTOR_SIZE 512
 
@@ -100,8 +142,40 @@ static struct block_device_operations cryptrd_ops = {
 		.getgeo = cryptrd_getgeo
 };
 
+static void cryptrd_root_dev_release(struct device *dev)
+{
+}
+
+static struct device cryptrd_root_dev = {
+	.init_name = "cryptrd",
+	.release = cryptrd_root_dev_release,
+};
+
+static int cryptrd_sysfs_init(void)
+{
+	int ret;
+	/*cryptrd_root_dev.p->driver_data = &dev;*/
+	ret = device_register(&cryptrd_root_dev);
+	if (ret < 0)
+		return ret;
+
+	ret = device_create_file(&cryptrd_root_dev, &dev_attr_key);
+	if (ret < 0) {
+		device_unregister(&cryptrd_root_dev);
+		return ret;
+	}
+}
+
+static void cryptrd_sysfs_release(void)
+{
+	device_remove_file(&cryptrd_root_dev, &dev_attr_key);
+	device_unregister(&cryptrd_root_dev);
+}
+
 static int __init cryptrd_init(void)
 {
+	int ret;
+
 	dev.size = nsectors * logical_block_size;
 	spin_lock_init(&dev.lock);
 	dev.data = vmalloc(dev.size);
@@ -137,6 +211,11 @@ static int __init cryptrd_init(void)
 	strcpy(dev.gd->disk_name, "cryptrd0");
 	set_capacity(dev.gd, nsectors);
 	dev.gd->queue = dev.queue;
+
+	ret = cryptrd_sysfs_init();
+	if (ret < 0)
+		goto out_unregister;
+
 	add_disk(dev.gd);
 
 	return 0;
@@ -150,6 +229,8 @@ out:
 
 static void __exit cryptrd_exit(void)
 {
+	cryptrd_sysfs_release();
+
 	del_gendisk(dev.gd);
 	put_disk(dev.gd);
 	unregister_blkdev(cryptrd_major, "cryptrd");
