@@ -28,6 +28,11 @@
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
 
+#define KERNEL_SECTOR_SIZE 512
+
+#define ENCRYPT 1
+#define DECRYPT 0
+
 static int cryptrd_major = 0;
 module_param(cryptrd_major, int, 0);
 
@@ -37,14 +42,13 @@ module_param(logical_block_size, int, 0);
 static int nsectors = 1024;
 module_param(nsectors, int, 0);
 
-#define KEY_SIZE 32
+#define KEY_SIZE 32 /* AES has a maximum key size of 256 bits */
 static char crypto_key[KEY_SIZE];
-
-static struct crypto_ablkcipher *tfm;
+static int key_size = 0; /* size of the current key */
 
 ssize_t key_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	printk("cryptrd: copying key %s\n", crypto_key);
+	printk(KERN_DEBUG "cryptrd: copying key\n");
 	return scnprintf(buf, PAGE_SIZE, "%s\n", crypto_key);
 }
 
@@ -52,21 +56,30 @@ ssize_t key_store(struct device *dev, struct device_attribute *attr,
                   const char *buf, size_t count)
 {
 	if (count != 16 && count != 24 && count != 32) {
-		printk(KERN_WARNING "cryptrd: invalid key size\n");
+		printk(KERN_WARNING "cryptrd: invalid key size %d\n", count);
 		return -EINVAL;
 	}
 
-	printk("cryptrd: storing key %s\n", buf);
+	printk(KERN_DEBUG "cryptrd: storing key\n");
 	snprintf(crypto_key, sizeof(crypto_key), "%.*s",
 		 (int)min(count, sizeof(crypto_key) - 1), buf);
-	crypto_ablkcipher_setkey(tfm, crypto_key, KEY_SIZE);
+	key_size = count;
 	return count;
 }
 
 DEVICE_ATTR(key, 0600, key_show, key_store);
 
-#define KERNEL_SECTOR_SIZE 512
+static void cryptrd_root_dev_release(struct device *dev)
+{
+}
 
+/* our device for sysfs */
+static struct device cryptrd_root_dev = {
+	.init_name = "cryptrd",
+	.release = cryptrd_root_dev_release,
+};
+
+/* the device private data */
 static struct cryptrd_device {
 	unsigned long size;
 	u8 *data;
@@ -77,7 +90,7 @@ static struct cryptrd_device {
 
 static int cryptrd_encrypt(char *input, int input_length, int enc)
 {
-	char *algo = "ecb(aes)";
+	char *algo = "ecb(aes)"; /* could be made a module param */
 	struct crypto_ablkcipher *tfm;
 	struct ablkcipher_request *req;
 	struct completion comp;
@@ -86,7 +99,14 @@ static int cryptrd_encrypt(char *input, int input_length, int enc)
 
 	char iv = 0xc6;
 
-	printk("Encrypt Operation: %d; len: %d\n", enc, input_length);
+	printk(KERN_DEBUG "cryptrd: %s %d bytes\n",
+	                  enc ? "encrypting" : "decrypting",
+	                  input_length);
+
+	if (key_size == 0) {
+		printk(KERN_NOTICE "cryptrd: no key set\n");
+		return -EINVAL;
+	}
 
 	init_completion(&comp);
 
@@ -97,8 +117,7 @@ static int cryptrd_encrypt(char *input, int input_length, int enc)
 
 	crypto_ablkcipher_set_flags(tfm, CRYPTO_TFM_REQ_WEAK_KEY);
 
-	printk("cryptrd: setting key %s\n", crypto_key);
-	ret = crypto_ablkcipher_setkey(tfm, crypto_key, KEY_SIZE);
+	ret = crypto_ablkcipher_setkey(tfm, crypto_key, key_size);
 	if (ret < 0) {
 		printk(KERN_ERR "cryptrd: setkey error %d\n", ret);
 		goto out;
@@ -108,7 +127,7 @@ static int cryptrd_encrypt(char *input, int input_length, int enc)
 
 	ablkcipher_request_set_crypt(req, sg, sg, input_length, iv);
 
-	if (enc)
+	if (enc == ENCRYPT)
 		ret = crypto_ablkcipher_encrypt(req);
 	else
 		ret = crypto_ablkcipher_decrypt(req);
@@ -125,8 +144,7 @@ static int cryptrd_encrypt(char *input, int input_length, int enc)
 		}
 
 	default:
-		printk(KERN_ERR "%d failed err=%d\n", enc, ret);
-		ret = -1;
+		printk(KERN_ERR "cryptrd: crypto failed err=%d\n", enc, ret);
 		goto out;
 	}
 
@@ -172,26 +190,23 @@ static void cryptrd_request(struct request_queue *q)
 			continue;
 		}
 
-		/* Allocate memory for encryption */
 		enc_size = blk_rq_cur_sectors(req) * KERNEL_SECTOR_SIZE;
 		enc_area = kmalloc(enc_size, GFP_KERNEL);
 
 		if (rq_data_dir(req)) { /* write */
-			/* copy buffer to working area and encrypt */
 			memcpy(enc_area, req->buffer, enc_size);
 
-			cryptrd_encrypt(enc_area, enc_size, 1);
+			cryptrd_encrypt(enc_area, enc_size, ENCRYPT);
 
 			cryptrd_transfer(&dev, blk_rq_pos(req),
 			                 blk_rq_cur_sectors(req),
 			                 enc_area, rq_data_dir(req));
 		} else { /* read */
-			/* copy buffer to working area and decrypt */
 			cryptrd_transfer(&dev, blk_rq_pos(req),
 			                 blk_rq_cur_sectors(req),
 			                 enc_area, rq_data_dir(req));
 
-			cryptrd_encrypt(enc_area, enc_size, 0);
+			cryptrd_encrypt(enc_area, enc_size, DECRYPT);
 
 			memcpy(req->buffer, enc_area, enc_size);
 		}
@@ -222,15 +237,6 @@ static struct block_device_operations cryptrd_ops = {
 		.getgeo = cryptrd_getgeo
 };
 
-static void cryptrd_root_dev_release(struct device *dev)
-{
-}
-
-static struct device cryptrd_root_dev = {
-	.init_name = "cryptrd",
-	.release = cryptrd_root_dev_release,
-};
-
 static int cryptrd_sysfs_init(void)
 {
 	int ret;
@@ -253,23 +259,9 @@ static void cryptrd_sysfs_release(void)
 	device_unregister(&cryptrd_root_dev);
 }
 
-static int cryptrd_crypto_init(void)
+static int cryptrd_disk_init(void)
 {
-	tfm = crypto_alloc_ablkcipher("cbc(aes)", 0, 0);
-	if (IS_ERR(tfm))
-		return PTR_ERR(tfm);
-	return 0;
-}
-
-static void cryptrd_crypto_release(void)
-{
-	if (tfm)
-		crypto_free_ablkcipher(tfm);
-}
-
-static int __init cryptrd_init(void)
-{
-	int ret;
+	int err = 0;
 
 	dev.size = nsectors * logical_block_size;
 	spin_lock_init(&dev.lock);
@@ -282,6 +274,7 @@ static int __init cryptrd_init(void)
 	dev.queue = blk_init_queue(cryptrd_request, &dev.lock);
 	if (dev.queue == NULL) {
 		printk(KERN_WARNING "cryptrd: blk_init_queue failure\n");
+		err = -ENOMEM;
 		goto out;
 	}
 
@@ -290,12 +283,14 @@ static int __init cryptrd_init(void)
 	cryptrd_major = register_blkdev(cryptrd_major, "cryptrd");
 	if (cryptrd_major < 0) {
 		printk(KERN_WARNING "cryptrd: unable to get major number\n");
-		goto out;
+		err = cryptrd_major;
+		goto out_queue;
 	}
 
 	dev.gd = alloc_disk(16);
 	if (!dev.gd) {
 		printk(KERN_WARNING "cryptrd: alloc_disk failure");
+		err = -ENOMEM;
 		goto out_unregister;
 	}
 
@@ -307,37 +302,52 @@ static int __init cryptrd_init(void)
 	set_capacity(dev.gd, nsectors);
 	dev.gd->queue = dev.queue;
 
-	ret = cryptrd_sysfs_init();
-	if (ret < 0)
-		goto out_unregister;
-
-	ret = cryptrd_crypto_init();
-	if (ret < 0)
-		goto out_sysfs;
-
-	add_disk(dev.gd);
-
 	return 0;
 
-out_sysfs:
-	cryptrd_sysfs_release();
 out_unregister:
 	unregister_blkdev(cryptrd_major, "cryptrd");
+out_queue:
+	blk_cleanup_queue(dev.queue);
 out:
 	vfree(dev.data);
 	return -ENOMEM;
 }
 
-static void __exit cryptrd_exit(void)
+static void cryptrd_disk_release(void)
 {
-	cryptrd_crypto_release();
-	cryptrd_sysfs_release();
-
 	del_gendisk(dev.gd);
 	put_disk(dev.gd);
 	unregister_blkdev(cryptrd_major, "cryptrd");
 	blk_cleanup_queue(dev.queue);
 	vfree(dev.data);
+}
+
+static int __init cryptrd_init(void)
+{
+	int ret;
+
+	ret = cryptrd_disk_init();
+	if (ret < 0)
+		goto out;
+
+	ret = cryptrd_sysfs_init();
+	if (ret < 0)
+		goto out_disk;
+
+	add_disk(dev.gd);
+
+	return 0;
+
+out_disk:
+	cryptrd_disk_release();
+out:
+	return ret;
+}
+
+static void __exit cryptrd_exit(void)
+{
+	cryptrd_sysfs_release();
+	cryptrd_disk_release();
 }
 
 module_init(cryptrd_init);
