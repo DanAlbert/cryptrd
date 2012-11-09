@@ -7,8 +7,7 @@
  * 	Kellie Suehisa
  *
  * The basis of this driver was taken from the block device example in Linux
- * Device Drivers 3rd Edition, exerpts from an old version of this project,
- * http://lwn.net/Articles/58719/ and
+ * Device Drivers 3rd Edition, http://lwn.net/Articles/58719/ and
  * http://blog.superpat.com/2010/05/04/a-simple-block-driver-for-linux-kernel-2-6-31/
  */
 #include <linux/module.h>
